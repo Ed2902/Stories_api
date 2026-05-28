@@ -1,0 +1,76 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum StoryStatus {
+  UNDER_REVIEW
+  ACTIVE
+  BLOCKED
+  EXPIRED
+}
+
+enum StoryModerationStatus {
+  APPROVED
+  NEEDS_REVIEW
+  BLOCKED
+  ERROR
+}
+
+enum StoryModerationRiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum StoryModerationRecommendedAction {
+  APPROVE
+  KEEP_VISIBLE
+  SEND_TO_REVIEW
+  REMOVE_PRODUCT
+}
+
+model Story {
+  id                          String                           @id @default(uuid())
+  ownerUserId                 String
+  caption                     String?
+  status                      StoryStatus                      @default(UNDER_REVIEW)
+  storagePath                 String                           @unique
+  storageUrl                  String
+  mimeType                    String
+  sizeBytes                   Int
+  moderationStatus            StoryModerationStatus?
+  moderationRiskLevel         StoryModerationRiskLevel?
+  moderationConfidence        Float?
+  moderationFlags             String[]                         @default([])
+  moderationRecommendedAction StoryModerationRecommendedAction?
+  moderationErrorMessage      String?
+  moderationRawResult         Json?
+  moderationReviewedAt        DateTime?
+  publishedAt                 DateTime?
+  expiresAt                   DateTime
+  createdAt                   DateTime                         @default(now())
+  updatedAt                   DateTime                         @updatedAt
+  deletedAt                   DateTime?
+  views                       StoryView[]
+
+  @@index([ownerUserId, createdAt(sort: Desc)])
+  @@index([status, expiresAt])
+  @@index([publishedAt(sort: Desc)])
+}
+
+model StoryView {
+  id           String   @id @default(uuid())
+  storyId      String
+  viewerUserId String
+  viewedAt     DateTime @default(now())
+  story        Story    @relation(fields: [storyId], references: [id], onDelete: Cascade)
+
+  @@unique([storyId, viewerUserId])
+  @@index([viewerUserId, viewedAt(sort: Desc)])
+}
