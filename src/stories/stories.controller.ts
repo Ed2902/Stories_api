@@ -12,6 +12,8 @@ import {
 import { CurrentAuthUser } from '../auth/decorators/current-auth-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import type { AuthenticatedRequestUser } from '../auth/interfaces/authenticated-request.interface';
+import { MediaUploadRateLimit } from '../common/decorators/media-upload-rate-limit.decorator';
+import { StoriesFeedRateLimit } from '../common/decorators/stories-feed-rate-limit.decorator';
 import { ConfirmStoryUploadDto } from './dto/confirm-story-upload.dto';
 import { CreateStoryUploadUrlDto } from './dto/create-story-upload-url.dto';
 import { ListStoriesQueryDto } from './dto/list-stories-query.dto';
@@ -23,6 +25,7 @@ export class StoriesController {
   constructor(private readonly storiesService: StoriesService) {}
 
   @Get('feed')
+  @StoriesFeedRateLimit()
   listFeed(
     @CurrentAuthUser() actor: AuthenticatedRequestUser,
     @Query() query: ListStoriesQueryDto,
@@ -31,6 +34,7 @@ export class StoriesController {
   }
 
   @Get('me')
+  @StoriesFeedRateLimit()
   listMine(
     @CurrentAuthUser() actor: AuthenticatedRequestUser,
     @Query() query: ListStoriesQueryDto,
@@ -39,6 +43,7 @@ export class StoriesController {
   }
 
   @Get('users/:userId')
+  @StoriesFeedRateLimit()
   listUserStories(
     @CurrentAuthUser() actor: AuthenticatedRequestUser,
     @Param('userId', new ParseUUIDPipe()) userId: string,
@@ -48,6 +53,7 @@ export class StoriesController {
   }
 
   @Post('upload-url')
+  @MediaUploadRateLimit()
   createUploadUrl(
     @CurrentAuthUser() actor: AuthenticatedRequestUser,
     @Body() createUploadUrlDto: CreateStoryUploadUrlDto,
@@ -56,6 +62,7 @@ export class StoriesController {
   }
 
   @Post('confirm')
+  @MediaUploadRateLimit()
   confirmUpload(
     @CurrentAuthUser() actor: AuthenticatedRequestUser,
     @Body() confirmStoryUploadDto: ConfirmStoryUploadDto,

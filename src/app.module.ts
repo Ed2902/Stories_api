@@ -11,6 +11,7 @@ import { AppConfigModule } from './config/app-config.module';
 import { HealthModule } from './health/health.module';
 import { AppLoggerModule } from './logger/logger.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { RedisModule } from './redis/redis.module';
 import { StoriesModule } from './stories/stories.module';
 import { StorageModule } from './storage/storage.module';
 
@@ -21,6 +22,7 @@ import { StorageModule } from './storage/storage.module';
     CommonModule,
     AuthModule,
     PrismaModule,
+    RedisModule,
     StorageModule,
     HealthModule,
     StoriesModule,

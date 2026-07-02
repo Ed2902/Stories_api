@@ -1,7 +1,8 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -15,6 +16,7 @@ import {
   S3ServiceException,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { RedisService } from '../redis/redis.service';
 
 const allowedMimeTypes = {
   'image/jpeg': 'jpg',
@@ -22,19 +24,44 @@ const allowedMimeTypes = {
   'image/webp': 'webp',
 } as const;
 
+export const STORY_UPLOAD_URL_TTL_SECONDS = 5 * 60;
+export const STORY_READ_URL_TTL_SECONDS = 60 * 60;
+export const STORY_READ_URL_CACHE_TTL_SECONDS = 5 * 60;
+const STORY_READ_URL_CACHE_MAX_ENTRIES = 2000;
+const STORY_READ_URL_CACHE_KEY_PREFIX = 'stories:storage:media-read-url';
+const STORY_THUMBNAIL_PRESET = {
+  width: 360,
+  height: 640,
+  quality: 75,
+};
+
 type AllowedMimeType = keyof typeof allowedMimeTypes;
+type CachedSignedUrl = {
+  url: string;
+  expiresAt: number;
+  source?: 'redis' | 'local';
+};
 
 @Injectable()
 export class StorageService {
+  private readonly logger = new Logger(StorageService.name);
   private readonly client: S3Client;
   private readonly bucket: string;
   private readonly publicBaseUrl: string;
+  private readonly mediaCdnBaseUrl?: string;
   private readonly maxUploadSize: number;
+  private readonly readUrlCache = new Map<string, CachedSignedUrl>();
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly redisService: RedisService,
+  ) {
     this.bucket = this.configService.getOrThrow<string>('storage.bucket');
     this.publicBaseUrl =
       this.configService.getOrThrow<string>('storage.publicBaseUrl');
+    this.mediaCdnBaseUrl =
+      this.configService.get<string>('storage.mediaCdnBaseUrl')?.trim() ||
+      undefined;
     this.maxUploadSize =
       this.configService.getOrThrow<number>('storage.maxUploadSize');
     this.client = new S3Client({
@@ -72,7 +99,7 @@ export class StorageService {
       ContentType: input.mimeType,
     });
     const uploadUrl = await getSignedUrl(this.client, command, {
-      expiresIn: 300,
+      expiresIn: STORY_UPLOAD_URL_TTL_SECONDS,
     });
 
     return {
@@ -86,19 +113,50 @@ export class StorageService {
   }
 
   async createStoryReadUrl(storageKey: string) {
+    const startedAt = Date.now();
+    const cached = await this.getCachedReadUrl(storageKey);
+
+    if (cached) {
+      this.logger.debug({
+        event: 'storage.signed_url_cache',
+        service: 'stories',
+        mediaType: 'story_media',
+        result: `${cached.source ?? 'local'}_hit`,
+        durationMs: Date.now() - startedAt,
+      });
+      return cached.url;
+    }
+
     const command = new GetObjectCommand({
       Bucket: this.bucket,
       Key: storageKey,
     });
 
-    return getSignedUrl(this.client, command, {
-      expiresIn: 3600,
+    const url = await getSignedUrl(this.client, command, {
+      expiresIn: STORY_READ_URL_TTL_SECONDS,
     });
+
+    this.cacheReadUrl(storageKey, url, STORY_READ_URL_CACHE_TTL_SECONDS);
+
+    this.logger.log({
+      event: 'storage.signed_url_generated',
+      service: 'stories',
+      mediaType: 'story_media',
+      durationMs: Date.now() - startedAt,
+      signedUrlTtlSeconds: STORY_READ_URL_TTL_SECONDS,
+      cacheTtlSeconds: STORY_READ_URL_CACHE_TTL_SECONDS,
+    });
+
+    return url;
   }
 
   createStoryPublicUrl(storageKey: string) {
     const normalizedBaseUrl = this.publicBaseUrl.replace(/\/+$/, '');
     return `${normalizedBaseUrl}/${this.bucket}/${storageKey}`;
+  }
+
+  createStoryThumbnailUrl(storageKey: string) {
+    return this.createCdnImageUrl(storageKey, STORY_THUMBNAIL_PRESET);
   }
 
   assertStoryOwnership(userId: string, storageKey: string) {
@@ -192,5 +250,92 @@ export class StorageService {
     }
 
     return sanitizedFileName.slice(lastDotIndex + 1);
+  }
+
+  private cacheReadUrl(storageKey: string, url: string, ttlSeconds: number) {
+    if (this.readUrlCache.size >= STORY_READ_URL_CACHE_MAX_ENTRIES) {
+      const oldestKey = this.readUrlCache.keys().next().value;
+
+      if (oldestKey) {
+        this.readUrlCache.delete(oldestKey);
+      }
+    }
+
+    this.readUrlCache.set(storageKey, {
+      url,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+
+    void this.redisService
+      .getClient()
+      .set(this.buildReadUrlCacheKey(storageKey), url, 'EX', ttlSeconds)
+      .catch((error: unknown) => {
+        this.logger.warn(
+          { err: error },
+          'Redis story read URL cache write failed',
+        );
+      });
+  }
+
+  private async getCachedReadUrl(storageKey: string) {
+    try {
+      const cachedUrl = await this.redisService
+        .getClient()
+        .get(this.buildReadUrlCacheKey(storageKey));
+
+      if (cachedUrl) {
+        return {
+          url: cachedUrl,
+          expiresAt: Date.now() + STORY_READ_URL_CACHE_TTL_SECONDS * 1000,
+          source: 'redis',
+        };
+      }
+    } catch (error) {
+      this.logger.warn(
+        { err: error },
+        'Redis story read URL cache read failed',
+      );
+    }
+
+    const cached = this.readUrlCache.get(storageKey);
+
+    if (cached && cached.expiresAt > Date.now()) {
+      return {
+        ...cached,
+        source: 'local',
+      };
+    }
+
+    return null;
+  }
+
+  private buildReadUrlCacheKey(storageKey: string) {
+    return `${STORY_READ_URL_CACHE_KEY_PREFIX}:${createHash('sha256')
+      .update(storageKey)
+      .digest('hex')}`;
+  }
+
+  private createCdnImageUrl(
+    storageKey: string,
+    options: { width: number; height: number; quality: number },
+  ) {
+    if (!this.mediaCdnBaseUrl) {
+      return null;
+    }
+
+    const normalizedBaseUrl = this.mediaCdnBaseUrl.replace(/\/+$/, '');
+    const encodedStoragePath = storageKey
+      .split('/')
+      .map((segment) => encodeURIComponent(segment))
+      .join('/');
+    const transform = [
+      `width=${options.width}`,
+      `height=${options.height}`,
+      'fit=cover',
+      `quality=${options.quality}`,
+      'format=webp',
+    ].join(',');
+
+    return `${normalizedBaseUrl}/cdn-cgi/image/${transform}/${this.bucket}/${encodedStoragePath}`;
   }
 }

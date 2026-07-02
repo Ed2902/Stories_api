@@ -5,6 +5,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import { GlobalExceptionFilter } from './filters/global-exception.filter';
 import { ThrottlerBehindProxyGuard } from './guards/throttler-behind-proxy.guard';
 import { ResponseTimeInterceptor } from './interceptors/response-time.interceptor';
+import { CatalogCacheEventsService } from './catalog-cache-events.service';
 
 @Module({
   imports: [
@@ -23,18 +24,38 @@ import { ResponseTimeInterceptor } from './interceptors/response-time.intercepto
             ttl: configService.getOrThrow<number>('rateLimit.sensitiveTtl'),
             limit: configService.getOrThrow<number>('rateLimit.sensitiveLimit'),
           },
+          {
+            name: 'storiesFeed',
+            ttl: configService.getOrThrow<number>('rateLimit.storiesFeedTtl'),
+            limit: configService.getOrThrow<number>(
+              'rateLimit.storiesFeedLimit',
+            ),
+          },
+          {
+            name: 'mediaUpload',
+            ttl: configService.getOrThrow<number>('rateLimit.mediaUploadTtl'),
+            limit: configService.getOrThrow<number>(
+              'rateLimit.mediaUploadLimit',
+            ),
+          },
         ],
       }),
     }),
   ],
   providers: [
     GlobalExceptionFilter,
+    CatalogCacheEventsService,
     ResponseTimeInterceptor,
     {
       provide: APP_GUARD,
       useClass: ThrottlerBehindProxyGuard,
     },
   ],
-  exports: [GlobalExceptionFilter, ResponseTimeInterceptor, ThrottlerModule],
+  exports: [
+    GlobalExceptionFilter,
+    CatalogCacheEventsService,
+    ResponseTimeInterceptor,
+    ThrottlerModule,
+  ],
 })
 export class CommonModule {}

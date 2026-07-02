@@ -106,11 +106,30 @@ export default () => {
   database: {
     url: process.env.DATABASE_URL as string,
   },
+  redis: {
+    cacheUrl: process.env.REDIS_CACHE_URL as string,
+    queueUrl: process.env.REDIS_QUEUE_URL as string,
+    realtimeUrl: process.env.REDIS_REALTIME_URL?.trim() || undefined,
+  },
+  queue: {
+    prefix: process.env.QUEUE_PREFIX as string,
+    maxRetries: parseOptionalNumber(process.env.REDIS_QUEUE_MAX_RETRIES) ?? 3,
+    backoffMs: parseOptionalNumber(process.env.REDIS_QUEUE_BACKOFF_MS) ?? 1000,
+    removeOnComplete:
+      parseOptionalNumber(process.env.REDIS_QUEUE_REMOVE_ON_COMPLETE) ?? 1000,
+    removeOnFail:
+      parseOptionalNumber(process.env.REDIS_QUEUE_REMOVE_ON_FAIL) ?? 5000,
+  },
   auth: {
     accessTokenSecret: process.env.AUTH_ACCESS_TOKEN_SECRET as string,
   },
   identity: {
     baseUrl: process.env.IDENTITY_BASE_URL?.trim() || undefined,
+  },
+  catalogApi: {
+    baseUrl: process.env.CATALOG_API_BASE_URL?.trim() || undefined,
+    internalToken: process.env.CATALOG_INTERNAL_TOKEN?.trim() || undefined,
+    timeoutMs: parseOptionalNumber(process.env.CATALOG_API_TIMEOUT_MS),
   },
   storage: {
     endpoint: process.env.STORAGE_S3_ENDPOINT as string,
@@ -119,6 +138,7 @@ export default () => {
     bucket: process.env.STORAGE_S3_BUCKET as string,
     forcePathStyle: parseBoolean(process.env.STORAGE_S3_FORCE_PATH_STYLE as string),
     publicBaseUrl: process.env.STORAGE_S3_PUBLIC_BASE_URL as string,
+    mediaCdnBaseUrl: process.env.STORAGE_MEDIA_CDN_BASE_URL?.trim() || undefined,
     maxUploadSize: parseNumber(process.env.STORAGE_MAX_UPLOAD_SIZE as string),
   },
   moderation: {
@@ -132,6 +152,16 @@ export default () => {
     limit: parseNumber(process.env.RATE_LIMIT_LIMIT as string),
     sensitiveTtl: parseNumber(process.env.SENSITIVE_RATE_LIMIT_TTL as string),
     sensitiveLimit: parseNumber(process.env.SENSITIVE_RATE_LIMIT_LIMIT as string),
+    storiesFeedTtl:
+      parseOptionalNumber(process.env.STORIES_FEED_RATE_LIMIT_TTL) ??
+      parseNumber(process.env.RATE_LIMIT_TTL as string),
+    storiesFeedLimit:
+      parseOptionalNumber(process.env.STORIES_FEED_RATE_LIMIT_LIMIT) ?? 60,
+    mediaUploadTtl:
+      parseOptionalNumber(process.env.MEDIA_UPLOAD_RATE_LIMIT_TTL) ??
+      parseNumber(process.env.SENSITIVE_RATE_LIMIT_TTL as string),
+    mediaUploadLimit:
+      parseOptionalNumber(process.env.MEDIA_UPLOAD_RATE_LIMIT_LIMIT) ?? 30,
   },
   };
 };

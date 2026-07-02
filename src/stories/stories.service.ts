@@ -13,6 +13,7 @@ import {
   StoryStatus,
 } from '@prisma/client';
 import { sanitizePlainText } from '../common/utils/sanitize-text.util';
+import { CatalogCacheEventsService } from '../common/catalog-cache-events.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { StorageService } from '../storage/storage.service';
 import type { AuthenticatedRequestUser } from '../auth/interfaces/authenticated-request.interface';
@@ -53,6 +54,7 @@ export class StoriesService {
     private readonly prismaService: PrismaService,
     private readonly storageService: StorageService,
     private readonly configService: ConfigService,
+    private readonly catalogCacheEventsService: CatalogCacheEventsService,
   ) {}
 
   async createUploadUrl(
@@ -138,6 +140,12 @@ export class StoriesService {
       },
       include: storyInclude,
     });
+    if (story.status === StoryStatus.ACTIVE) {
+      this.catalogCacheEventsService.publish({
+        eventType: 'story.created',
+        ownerUserId: actor.userId,
+      });
+    }
 
     return this.serializeStory(story, actor.userId);
   }
@@ -179,9 +187,9 @@ export class StoriesService {
             new Date(left.createdAt).getTime() - new Date(right.createdAt).getTime(),
         );
         const previewStory = ownerStories[0];
-        const previewUrl = await this.storageService.createStoryReadUrl(
-          previewStory.storagePath,
-        );
+        const previewUrl =
+          this.storageService.createStoryThumbnailUrl(previewStory.storagePath) ??
+          (await this.storageService.createStoryReadUrl(previewStory.storagePath));
 
         return {
           ownerUserId,
@@ -397,6 +405,19 @@ export class StoriesService {
       },
       include: storyInclude,
     });
+    if (
+      updated.status !== story.status ||
+      updated.publishedAt?.getTime() !== story.publishedAt?.getTime()
+    ) {
+      this.catalogCacheEventsService.publish({
+        eventType:
+          updated.status === StoryStatus.EXPIRED ||
+          updated.status === StoryStatus.BLOCKED
+            ? 'story.expired'
+            : 'story.created',
+        ownerUserId: updated.ownerUserId,
+      });
+    }
 
     return this.serializeAdminStory(updated);
   }
@@ -424,6 +445,10 @@ export class StoriesService {
     } catch {
       // La historia queda oculta aunque falle la limpieza del archivo.
     }
+    this.catalogCacheEventsService.publish({
+      eventType: 'story.expired',
+      ownerUserId: story.ownerUserId,
+    });
 
     return this.serializeAdminStory(updated);
   }
@@ -582,6 +607,9 @@ export class StoriesService {
       status: story.status,
       mimeType: story.mimeType,
       mediaUrl: await this.storageService.createStoryReadUrl(story.storagePath),
+      thumbnailUrl: this.storageService.createStoryThumbnailUrl(
+        story.storagePath,
+      ),
       viewCount: story._count.views,
       hasViewed: story.views.some(view => view.viewerUserId === viewerUserId),
       expiresAt: story.expiresAt.toISOString(),
@@ -608,6 +636,9 @@ export class StoriesService {
       status: story.status,
       storageUrl: story.storageUrl,
       mediaUrl: await this.storageService.createStoryReadUrl(story.storagePath),
+      thumbnailUrl: this.storageService.createStoryThumbnailUrl(
+        story.storagePath,
+      ),
       mimeType: story.mimeType,
       sizeBytes: story.sizeBytes,
       viewCount: story._count.views,
@@ -638,7 +669,7 @@ export class StoriesService {
   }
 
   private async expireDueStories() {
-    await this.prismaService.story.updateMany({
+    const dueStories = await this.prismaService.story.findMany({
       where: {
         deletedAt: null,
         expiresAt: {
@@ -648,9 +679,37 @@ export class StoriesService {
           in: [StoryStatus.ACTIVE, StoryStatus.UNDER_REVIEW],
         },
       },
+      select: {
+        id: true,
+        ownerUserId: true,
+      },
+    });
+
+    if (!dueStories.length) {
+      return;
+    }
+
+    await this.prismaService.story.updateMany({
+      where: {
+        id: {
+          in: dueStories.map((story) => story.id),
+        },
+        deletedAt: null,
+        status: {
+          in: [StoryStatus.ACTIVE, StoryStatus.UNDER_REVIEW],
+        },
+      },
       data: {
         status: StoryStatus.EXPIRED,
       },
     });
+    for (const ownerUserId of [
+      ...new Set(dueStories.map((story) => story.ownerUserId)),
+    ]) {
+      this.catalogCacheEventsService.publish({
+        eventType: 'story.expired',
+        ownerUserId,
+      });
+    }
   }
 }
