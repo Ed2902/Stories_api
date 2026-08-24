@@ -125,6 +125,7 @@ export default () => {
   },
   identity: {
     baseUrl: process.env.IDENTITY_BASE_URL?.trim() || undefined,
+    internalToken: process.env.IDENTITY_INTERNAL_TOKEN?.trim() || undefined,
   },
   catalogApi: {
     baseUrl: process.env.CATALOG_API_BASE_URL?.trim() || undefined,
@@ -146,6 +147,12 @@ export default () => {
     imageAnalyzerTimeoutMs:
       parseOptionalNumber(process.env.IMAGE_ANALYZER_TIMEOUT_MS) ?? 15000,
     internalToken: process.env.MODERATION_INTERNAL_TOKEN?.trim() || undefined,
+  },
+  notifications: {
+    baseUrl: process.env.NOTIFICATIONS_API_BASE_URL?.trim() || undefined,
+    internalToken:
+      process.env.NOTIFICATIONS_INTERNAL_TOKEN?.trim() || undefined,
+    timeoutMs: parseOptionalNumber(process.env.NOTIFICATIONS_API_TIMEOUT_MS) ?? 5000,
   },
   rateLimit: {
     ttl: parseNumber(process.env.RATE_LIMIT_TTL as string),

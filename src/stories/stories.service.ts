@@ -1,7 +1,10 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
+  OnModuleDestroy,
+  OnModuleInit,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -35,6 +38,14 @@ type ImageAnalyzerResponse = {
   recommendedAction: keyof typeof StoryModerationRecommendedAction;
 };
 
+type StoryOwnerAudienceSummary = {
+  userId: string;
+  isPremium: boolean;
+  isFollowingByViewer: boolean;
+};
+
+const STALE_STORY_STATE_RETENTION_MS = 60 * 60 * 1000;
+
 const storyInclude = {
   views: {
     select: {
@@ -49,13 +60,30 @@ const storyInclude = {
 } satisfies Prisma.StoryInclude;
 
 @Injectable()
-export class StoriesService {
+export class StoriesService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(StoriesService.name);
+  private expirationSweepInterval: NodeJS.Timeout | null = null;
+
   constructor(
     private readonly prismaService: PrismaService,
     private readonly storageService: StorageService,
     private readonly configService: ConfigService,
     private readonly catalogCacheEventsService: CatalogCacheEventsService,
   ) {}
+
+  onModuleInit() {
+    void this.expireDueStories();
+    this.expirationSweepInterval = setInterval(() => {
+      void this.expireDueStories();
+    }, 60_000);
+  }
+
+  onModuleDestroy() {
+    if (this.expirationSweepInterval) {
+      clearInterval(this.expirationSweepInterval);
+      this.expirationSweepInterval = null;
+    }
+  }
 
   async createUploadUrl(
     actor: AuthenticatedRequestUser,
@@ -96,56 +124,58 @@ export class StoriesService {
       return this.serializeStory(existingStory, actor.userId);
     }
 
-    const caption = confirmStoryUploadDto.caption?.trim()
-      ? sanitizePlainText(confirmStoryUploadDto.caption, {
-          preserveNewLines: false,
-        })
-      : null;
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const readUrl = await this.storageService.createStoryReadUrl(
-      confirmStoryUploadDto.storageKey,
-    );
-    const moderation = await this.moderateStoryImage({
-      storyKey: confirmStoryUploadDto.storageKey,
-      imageUrl: readUrl,
+    const caption = sanitizePlainText(confirmStoryUploadDto.caption.trim(), {
+      preserveNewLines: false,
     });
-    const { status, moderationStatus } = this.resolveStatuses(
-      moderation.recommendedAction,
-    );
-    const publishedAt = status === StoryStatus.ACTIVE ? new Date() : null;
+
+    if (!caption) {
+      throw new BadRequestException(
+        'Agrega una descripcion corta para publicar tu historia.',
+      );
+    }
+
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const publishedAt = new Date();
 
     const story = await this.prismaService.story.create({
       data: {
         ownerUserId: actor.userId,
         caption,
-        status,
+        status: StoryStatus.ACTIVE,
         storagePath: confirmStoryUploadDto.storageKey,
         storageUrl: this.storageService.createStoryPublicUrl(
           confirmStoryUploadDto.storageKey,
         ),
         mimeType: confirmStoryUploadDto.mimeType,
         sizeBytes: confirmStoryUploadDto.size,
-        moderationStatus,
-        moderationRiskLevel:
-          moderation.riskLevel as StoryModerationRiskLevel,
-        moderationConfidence: moderation.confidence,
-        moderationFlags: moderation.flags,
-        moderationRecommendedAction:
-          moderation.recommendedAction as StoryModerationRecommendedAction,
-        moderationRawResult: moderation as unknown as Prisma.InputJsonValue,
-        moderationReviewedAt: new Date(),
+        moderationStatus: null,
+        moderationRiskLevel: null,
+        moderationConfidence: null,
+        moderationFlags: [],
+        moderationRecommendedAction: null,
+        moderationRawResult: undefined,
+        moderationReviewedAt: null,
         moderationErrorMessage: null,
         publishedAt,
         expiresAt,
       },
       include: storyInclude,
     });
-    if (story.status === StoryStatus.ACTIVE) {
-      this.catalogCacheEventsService.publish({
-        eventType: 'story.created',
-        ownerUserId: actor.userId,
-      });
-    }
+    this.catalogCacheEventsService.publish({
+      eventType: 'story.created',
+      ownerUserId: actor.userId,
+    });
+
+    const readUrl = await this.storageService.createStoryReadUrl(
+      confirmStoryUploadDto.storageKey,
+    );
+
+    void this.moderateStoryAfterPublish({
+      storyId: story.id,
+      ownerUserId: story.ownerUserId,
+      storyKey: confirmStoryUploadDto.storageKey,
+      imageUrl: readUrl,
+    });
 
     return this.serializeStory(story, actor.userId);
   }
@@ -168,6 +198,10 @@ export class StoriesService {
       include: storyInclude,
       orderBy: [{ publishedAt: 'desc' }, { createdAt: 'desc' }],
     });
+    const visibleOwnerIds = await this.resolveVisibleStoryOwnerIds(
+      actor,
+      stories.map(story => story.ownerUserId),
+    );
 
     const grouped = new Map<
       string,
@@ -175,6 +209,10 @@ export class StoriesService {
     >();
 
     for (const story of stories) {
+      if (!visibleOwnerIds.has(story.ownerUserId)) {
+        continue;
+      }
+
       const bucket = grouped.get(story.ownerUserId) ?? [];
       bucket.push(story);
       grouped.set(story.ownerUserId, bucket);
@@ -241,6 +279,11 @@ export class StoriesService {
     query: ListStoriesQueryDto,
   ) {
     await this.expireDueStories();
+
+    if (!(await this.canViewerAccessStoryOwner(actor, userId))) {
+      return [];
+    }
+
     const take = query.take ?? 20;
     const stories = await this.prismaService.story.findMany({
       where: {
@@ -289,6 +332,10 @@ export class StoriesService {
         storyId,
         viewed: false,
       };
+    }
+
+    if (!(await this.canViewerAccessStoryOwner(actor, story.ownerUserId))) {
+      throw new NotFoundException('Story not found');
     }
 
     await this.prismaService.storyView.upsert({
@@ -340,6 +387,10 @@ export class StoriesService {
     } catch {
       // Story is already hidden even if the binary cleanup fails.
     }
+    this.catalogCacheEventsService.publish({
+      eventType: 'story.expired',
+      ownerUserId: story.ownerUserId,
+    });
 
     return {
       success: true,
@@ -350,6 +401,7 @@ export class StoriesService {
   async listAdminStories(query: ListAdminStoriesQueryDto) {
     await this.expireDueStories();
     const take = query.take ?? 50;
+    const skip = query.skip ?? 0;
     const search = query.q?.trim();
     const stories = await this.prismaService.story.findMany({
       where: {
@@ -368,6 +420,7 @@ export class StoriesService {
       },
       include: storyInclude,
       orderBy: [{ createdAt: 'desc' }],
+      skip,
       take,
     });
 
@@ -551,34 +604,6 @@ export class StoriesService {
     }
   }
 
-  private resolveStatuses(
-    recommendedAction: keyof typeof StoryModerationRecommendedAction,
-  ) {
-    if (
-      recommendedAction === StoryModerationRecommendedAction.APPROVE ||
-      recommendedAction === StoryModerationRecommendedAction.KEEP_VISIBLE
-    ) {
-      return {
-        status: StoryStatus.ACTIVE,
-        moderationStatus: StoryModerationStatus.APPROVED,
-      };
-    }
-
-    if (
-      recommendedAction === StoryModerationRecommendedAction.REMOVE_PRODUCT
-    ) {
-      return {
-        status: StoryStatus.BLOCKED,
-        moderationStatus: StoryModerationStatus.BLOCKED,
-      };
-    }
-
-    return {
-      status: StoryStatus.UNDER_REVIEW,
-      moderationStatus: StoryModerationStatus.NEEDS_REVIEW,
-    };
-  }
-
   private buildWorkerHeaders() {
     const internalToken = this.configService.get<string>(
       'moderation.internalToken',
@@ -594,6 +619,140 @@ export class StoriesService {
       'Content-Type': 'application/json',
       'X-Internal-Token': internalToken,
     };
+  }
+
+  private async canViewerAccessStoryOwner(
+    actor: AuthenticatedRequestUser,
+    ownerUserId: string,
+  ) {
+    if (actor.userId === ownerUserId) {
+      return true;
+    }
+
+    const ownerSummaries = await this.fetchStoryOwnerAudienceSummaries(actor, [
+      ownerUserId,
+    ]);
+
+    return this.isStoryOwnerVisibleToViewer(
+      ownerUserId,
+      actor.userId,
+      ownerSummaries.get(ownerUserId),
+    );
+  }
+
+  private async resolveVisibleStoryOwnerIds(
+    actor: AuthenticatedRequestUser,
+    ownerUserIds: string[],
+  ) {
+    const uniqueOwnerUserIds = [...new Set(ownerUserIds.filter(Boolean))];
+
+    if (!uniqueOwnerUserIds.length) {
+      return new Set<string>();
+    }
+
+    const ownerSummaries = await this.fetchStoryOwnerAudienceSummaries(
+      actor,
+      uniqueOwnerUserIds,
+    );
+
+    return new Set(
+      uniqueOwnerUserIds.filter(ownerUserId =>
+        this.isStoryOwnerVisibleToViewer(
+          ownerUserId,
+          actor.userId,
+          ownerSummaries.get(ownerUserId),
+        ),
+      ),
+    );
+  }
+
+  private isStoryOwnerVisibleToViewer(
+    ownerUserId: string,
+    viewerUserId: string,
+    ownerSummary?: StoryOwnerAudienceSummary,
+  ) {
+    return (
+      ownerUserId === viewerUserId ||
+      Boolean(ownerSummary?.isPremium) ||
+      Boolean(ownerSummary?.isFollowingByViewer)
+    );
+  }
+
+  private async fetchStoryOwnerAudienceSummaries(
+    actor: AuthenticatedRequestUser,
+    ownerUserIds: string[],
+  ) {
+    const uniqueOwnerUserIds = [...new Set(ownerUserIds.filter(Boolean))];
+
+    if (!uniqueOwnerUserIds.length) {
+      return new Map<string, StoryOwnerAudienceSummary>();
+    }
+
+    const baseUrl = this.configService.get<string | undefined>('identity.baseUrl');
+    const internalToken = this.configService.get<string | undefined>(
+      'identity.internalToken',
+    );
+
+    if (!baseUrl || !internalToken) {
+      this.logger.warn(
+        {
+          event: 'stories.visibility.identity_not_configured',
+          viewerUserId: actor.userId,
+          ownersCount: uniqueOwnerUserIds.length,
+        },
+        'Stories visibility fell back to private-only mode because Identity is not configured',
+      );
+
+      return new Map<string, StoryOwnerAudienceSummary>();
+    }
+
+    const controller = new AbortController();
+    const timeoutMs = 1500;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(
+        `${baseUrl.replace(/\/$/, '')}/api/internal/users/owner-summaries`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-internal-token': internalToken,
+          },
+          body: JSON.stringify({
+            userIds: uniqueOwnerUserIds,
+            viewerUserId: actor.userId,
+          }),
+          signal: controller.signal,
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error(`Identity returned HTTP ${response.status}`);
+      }
+
+      const payload = (await response.json()) as {
+        summaries?: StoryOwnerAudienceSummary[];
+      };
+
+      return new Map(
+        (payload.summaries ?? []).map(summary => [summary.userId, summary]),
+      );
+    } catch (error) {
+      this.logger.warn(
+        {
+          err: error,
+          event: 'stories.visibility.identity_lookup_failed',
+          viewerUserId: actor.userId,
+          ownersCount: uniqueOwnerUserIds.length,
+        },
+        'Stories visibility fell back to private-only mode after identity lookup failure',
+      );
+
+      return new Map<string, StoryOwnerAudienceSummary>();
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private async serializeStory(
@@ -622,6 +781,7 @@ export class StoriesService {
         flags: story.moderationFlags,
         recommendedAction: story.moderationRecommendedAction,
         errorMessage: story.moderationErrorMessage,
+        reviewedAt: story.moderationReviewedAt?.toISOString() ?? null,
       },
     };
   }
@@ -669,15 +829,48 @@ export class StoriesService {
   }
 
   private async expireDueStories() {
+    const now = new Date();
+    const staleStateCutoff = new Date(
+      now.getTime() - STALE_STORY_STATE_RETENTION_MS,
+    );
     const dueStories = await this.prismaService.story.findMany({
       where: {
         deletedAt: null,
-        expiresAt: {
-          lte: new Date(),
-        },
-        status: {
-          in: [StoryStatus.ACTIVE, StoryStatus.UNDER_REVIEW],
-        },
+        OR: [
+          {
+            expiresAt: {
+              lte: now,
+            },
+            status: {
+              in: [StoryStatus.ACTIVE, StoryStatus.UNDER_REVIEW],
+            },
+          },
+          {
+            updatedAt: {
+              lte: staleStateCutoff,
+            },
+            OR: [
+              {
+                status: StoryStatus.BLOCKED,
+              },
+              {
+                status: StoryStatus.UNDER_REVIEW,
+              },
+              {
+                status: StoryStatus.ACTIVE,
+                moderationStatus: null,
+              },
+              {
+                status: StoryStatus.ACTIVE,
+                moderationStatus: StoryModerationStatus.ERROR,
+              },
+              {
+                status: StoryStatus.ACTIVE,
+                moderationStatus: StoryModerationStatus.NEEDS_REVIEW,
+              },
+            ],
+          },
+        ],
       },
       select: {
         id: true,
@@ -696,7 +889,7 @@ export class StoriesService {
         },
         deletedAt: null,
         status: {
-          in: [StoryStatus.ACTIVE, StoryStatus.UNDER_REVIEW],
+          in: [StoryStatus.ACTIVE, StoryStatus.UNDER_REVIEW, StoryStatus.BLOCKED],
         },
       },
       data: {
@@ -710,6 +903,201 @@ export class StoriesService {
         eventType: 'story.expired',
         ownerUserId,
       });
+    }
+  }
+
+  private async moderateStoryAfterPublish(input: {
+    storyId: string;
+    ownerUserId: string;
+    storyKey: string;
+    imageUrl: string;
+  }) {
+    try {
+      const currentStory = await this.prismaService.story.findUnique({
+        where: { id: input.storyId },
+      });
+
+      if (
+        !currentStory ||
+        currentStory.deletedAt ||
+        currentStory.status === StoryStatus.EXPIRED
+      ) {
+        return;
+      }
+
+      const moderation = await this.moderateStoryImage({
+        storyKey: input.storyKey,
+        imageUrl: input.imageUrl,
+      });
+      const isApproved =
+        moderation.recommendedAction === StoryModerationRecommendedAction.APPROVE ||
+        moderation.recommendedAction === StoryModerationRecommendedAction.KEEP_VISIBLE;
+      const nextStatus = isApproved ? currentStory.status : StoryStatus.BLOCKED;
+      const moderationStatus = isApproved
+        ? StoryModerationStatus.APPROVED
+        : moderation.recommendedAction ===
+            StoryModerationRecommendedAction.REMOVE_PRODUCT
+          ? StoryModerationStatus.BLOCKED
+          : StoryModerationStatus.NEEDS_REVIEW;
+      const moderationErrorMessage = isApproved
+        ? null
+        : this.buildModerationRemovalReason(moderation);
+
+      const updated = await this.prismaService.story.update({
+        where: { id: input.storyId },
+        data: {
+          status: nextStatus,
+          moderationStatus,
+          moderationRiskLevel:
+            moderation.riskLevel as StoryModerationRiskLevel,
+          moderationConfidence: moderation.confidence,
+          moderationFlags: moderation.flags,
+          moderationRecommendedAction:
+            moderation.recommendedAction as StoryModerationRecommendedAction,
+          moderationRawResult: moderation as unknown as Prisma.InputJsonValue,
+          moderationReviewedAt: new Date(),
+          moderationErrorMessage,
+        },
+        include: storyInclude,
+      });
+
+      if (!isApproved && currentStory.status !== StoryStatus.BLOCKED) {
+        this.catalogCacheEventsService.publish({
+          eventType: 'story.expired',
+          ownerUserId: updated.ownerUserId,
+        });
+        await this.publishStoryModerationNotification(
+          updated,
+          moderationErrorMessage ?? 'La bajamos porque la imagen no cumple las reglas de publicacion.',
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        { err: error, storyId: input.storyId, event: 'story.moderation_failed' },
+        'Story moderation failed after publication',
+      );
+
+      try {
+        await this.prismaService.story.update({
+          where: { id: input.storyId },
+          data: {
+            moderationStatus: StoryModerationStatus.ERROR,
+            moderationReviewedAt: new Date(),
+            moderationErrorMessage:
+              'No pudimos completar la revision automatica. Tu historia sigue visible mientras lo reintentamos.',
+          },
+        });
+      } catch (updateError) {
+        this.logger.warn(
+          {
+            err: updateError,
+            storyId: input.storyId,
+            event: 'story.moderation_error_update_failed',
+          },
+          'Failed to store story moderation error state',
+        );
+      }
+    }
+  }
+
+  private buildModerationRemovalReason(moderation: ImageAnalyzerResponse) {
+    const flagLabels = moderation.flags
+      .map((flag) => this.describeModerationFlag(flag))
+      .filter(Boolean);
+
+    if (flagLabels.length === 1) {
+      return `La bajamos porque detectamos ${flagLabels[0]}.`;
+    }
+
+    if (flagLabels.length > 1) {
+      return `La bajamos porque detectamos ${flagLabels.join(', ')}.`;
+    }
+
+    if (
+      moderation.recommendedAction === StoryModerationRecommendedAction.SEND_TO_REVIEW
+    ) {
+      return 'La bajamos porque la imagen necesita una revision adicional antes de seguir visible.';
+    }
+
+    return 'La bajamos porque la imagen no cumple las reglas de publicacion de historias.';
+  }
+
+  private describeModerationFlag(flag: string) {
+    const labels: Record<string, string> = {
+      STICKER_OVERLAY: 'stickers o elementos que tapan el producto',
+      WATERMARK: 'una marca de agua sobre la imagen',
+      VISIBLE_TEXT: 'texto muy dominante en la imagen',
+      PHONE_NUMBER: 'un numero de contacto visible',
+      URL: 'un enlace visible',
+      EXTERNAL_CONTACT: 'datos de contacto externos',
+      IMAGE_DOWNLOAD_FAILED: 'un problema al validar la imagen',
+      INVALID_IMAGE: 'que el archivo no parecia una imagen valida',
+    };
+
+    return labels[flag] ?? null;
+  }
+
+  private async publishStoryModerationNotification(
+    story: Prisma.StoryGetPayload<{ include: typeof storyInclude }>,
+    reason: string,
+  ) {
+    const notificationsApiBaseUrl = this.configService.get<string>(
+      'notifications.baseUrl',
+    );
+    const notificationsInternalToken = this.configService.get<string>(
+      'notifications.internalToken',
+    );
+
+    if (!notificationsApiBaseUrl || !notificationsInternalToken) {
+      return;
+    }
+
+    const controller = new AbortController();
+    const timeoutMs =
+      this.configService.get<number>('notifications.timeoutMs') ?? 5000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(
+        `${notificationsApiBaseUrl.replace(/\/+$/, '')}/internal/notifications/publish`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Notifications-Token': notificationsInternalToken,
+          },
+          body: JSON.stringify({
+            userId: story.ownerUserId,
+            type: 'PUBLICATION_BLOCKED',
+            title: 'Bajamos tu historia',
+            body: reason,
+            subtitle: 'Toca para ver el detalle',
+            priority: 'HIGH',
+            sourceService: 'stories',
+            sourceEvent: 'story.moderation.blocked',
+            data: {
+              storyId: story.id,
+              storyOwnerUserId: story.ownerUserId,
+            },
+          }),
+          signal: controller.signal,
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error(`Notifications API returned HTTP ${response.status}`);
+      }
+    } catch (error) {
+      this.logger.warn(
+        {
+          err: error,
+          storyId: story.id,
+          event: 'story.moderation_notification_failed',
+        },
+        'Failed to publish story moderation notification',
+      );
+    } finally {
+      clearTimeout(timeout);
     }
   }
 }

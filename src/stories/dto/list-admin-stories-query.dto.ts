@@ -20,5 +20,11 @@ export class ListAdminStoriesQueryDto {
   @Min(1)
   @Max(100)
   take?: number;
-}
 
+  @IsOptional()
+  @Transform(({ value }) => Number(value))
+  @IsInt()
+  @Min(0)
+  @Max(5000)
+  skip?: number;
+}

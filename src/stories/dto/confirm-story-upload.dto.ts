@@ -1,13 +1,12 @@
-import { IsInt, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { IsInt, IsString, Max, MaxLength, Min } from 'class-validator';
 
 export class ConfirmStoryUploadDto {
   @IsString()
   storageKey!: string;
 
   @IsString()
-  @IsOptional()
   @MaxLength(180)
-  caption?: string;
+  caption!: string;
 
   @IsString()
   mimeType!: string;

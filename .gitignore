@@ -10,3 +10,4 @@ catalog-api.log
 catalog-api.err.log
 stories-run.log
 .codex-logs/
+*.log

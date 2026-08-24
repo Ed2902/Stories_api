@@ -41,6 +41,9 @@ export const envValidationSchema = Joi.object({
     .uri({ scheme: ['http', 'https'] })
     .allow('')
     .optional(),
+  IDENTITY_INTERNAL_TOKEN: Joi.string()
+    .allow('')
+    .optional(),
   CATALOG_API_BASE_URL: Joi.string()
     .uri({ scheme: ['http', 'https'] })
     .allow('')
